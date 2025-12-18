@@ -1,0 +1,119 @@
+
+```{r}
+################## Code for Binomial_Poisson_Mixture_Model #########################
+##################### PACKAGES, RUN SETTINGS, AND DATA #############################
+
+# Data: Import from local directory
+Binomial_Poisson_Mixture_Model_Data <- read.csv("Binomial_Poisson_Mixture_Model_Data.csv")
+
+# Packages
+library(rstan)
+library(dplyr)
+library(rv)
+
+# Run Settings
+rstan_options(auto_write = TRUE)
+options(mc.cores = min(c(parallel::detectCores(), 8)))
+nchains <- min(c(parallel::detectCores(), 8))
+niters <- 50000
+nkeep <- 2500
+nthin <- ceiling((niters/2) * nchains/nkeep)
+
+################### MODEL ################################
+
+# Binomial-Poisson Mixture Model
+Binomial_Poisson_Mixture_Model <- "
+data {
+  int<lower=0> Nobs;
+  int<lower=0> Nmax;
+  int<lower=0> Nyear;
+  int<lower=0,upper=Nyear> year[Nobs];
+  int y[Nobs];
+  vector[Nobs] Search;
+//  real alpha;
+//  real beta;
+}
+parameters {
+  vector[Nyear] lconc;
+  real mu;
+  real<lower=0,upper=10> sigma;
+//  real<lower=0,upper=1> r;
+}
+transformed parameters {
+  real lambda[Nobs];
+  for (i in 1:Nobs)
+    lambda[i] = exp(lconc[year[i]]) * Search[i];
+}
+model{
+  int k;
+//  r ~ beta(alpha, beta);
+  lconc ~ normal(mu, sigma);
+  for (i in 1:Nobs){
+    vector[Nmax-y[i]+1] temp;
+    for (j in y[i]:Nmax){
+      k = j-y[i]+1;
+      temp[k] = binomial_lpmf(y[i] | j, 0.31) +
+                poisson_lpmf(j | lambda[i]);
+    }
+    target += log_sum_exp(temp);
+  }
+}
+"
+
+
+stan_in1 <- function(data = Binomial_Poisson_Mixture_Model_Data, a = alpha, b = beta, chains = nchains,
+                     Nmax = 75){
+    y <- data$Catch
+    n <- length(y)
+    year <- as.numeric(ordered(data$Year))
+    nyear <- max(year)
+    stan_data <- list(Nobs = n, Nmax = Nmax, Nyear = nyear,
+                      year = year, Search = data$EFFHA,
+                      y=y)
+    stan_inits <- list()
+    for (i in 1:chains)
+        stan_inits[[i]] <- list(lconc=rnorm(nyear, -2),
+                                mu=rnorm(1, -2),
+                                sigma=runif(1))
+    stan_pars <- c("lconc", "mu", "sigma")
+    return(list(data=stan_data, inits=stan_inits,
+                pars=stan_pars, n.chains=chains))
+}
+
+
+fit_Binomial_Poisson_Mixture_Model <- stan_model(model_code = Binomial_Poisson_Mixture_Model)
+
+input.to.stan <- stan_in1(Binomial_Poisson_Mixture_Model_Data, Nmax = 75) 
+fit2keep_Binomial_Poisson_Mixture_Model <- sampling(fit_Binomial_Poisson_Mixture_Model, data=input.to.stan$data,
+                         init=input.to.stan$inits,
+                         pars=input.to.stan$pars,
+                         iter=niters,thin=nthin,
+                         chains=input.to.stan$n.chains)
+
+
+# Build Binomial–Poisson recruitment table with Rank/Index and convergence diagnostics
+Recruitment_Binomial_Poisson <- (function(fit, dat){
+  yrs  <- sort(unique(dat$Year))
+  S    <- rstan::extract(fit, pars = "lconc", permute = TRUE)$lconc
+  summ <- as.data.frame(rv::as.rvsummary(rv::rvsims(exp(S))))
+  summ <- summ[, setdiff(names(summ), "sims"), drop = FALSE]
+
+  # pick the median column
+  med_name <- intersect(c("median","Error_50","50%","q50"), names(summ))[1]
+  med <- as.numeric(summ[[med_name]])
+
+  q75  <- quantile(med, 0.75, na.rm = TRUE)
+  q25  <- quantile(med, 0.25, na.rm = TRUE)
+  Rank <- dplyr::dense_rank(-med)
+  Index <- ifelse(med >= q75, "Good", ifelse(med <= q25, "Poor", "Fair"))
+
+  diag <- as.data.frame(rstan::summary(fit, pars = "lconc")$summary)[, c("n_eff","Rhat")]
+  diag$n_eff <- as.integer(round(diag$n_eff))
+  diag$Rhat  <- as.integer(round(diag$Rhat))
+
+  cbind(summ, Year = yrs, Rank, Index, diag)
+})(fit2keep_Binomial_Poisson_Mixture_Model, Binomial_Poisson_Mixture_Model_Data)
+
+Recruitment_Binomial_Poisson
+
+```
